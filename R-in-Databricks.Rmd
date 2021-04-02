@@ -1,0 +1,258 @@
+
+---
+title: "R in Databricks"
+output:
+  html_document:
+    toc: true
+---
+
+The following notebook exported from Databricks contains the time to execute code blocks on a three node AWS i3.xlarge cluster. It demonstrates how to mount data in Databricks and does some comparisons of apply methods between SparkR and sparklyr.
+
+```{r}
+library(sparklyr)
+library(sparklyr.nested)
+library(dplyr)
+library(purrr)
+library(SparkR)
+```
+
+### Prepare sparklyr connection and configure
+
+```{r}
+# create a sparklyr connection
+sc <- spark_connect(method = "databricks")
+sc$config$sparklyr.apply.rlang = TRUE # Turns on improved serialization for sparklyr's spark_apply
+sc$config$sparklyr.arrow = TRUE # Use Apache Arrow to serialize data
+```
+
+### Mount S3 data
+
+*Time: 40 seconds*
+
+```{r}
+mountSources <- dbutils.fs.mounts() %>% purrr::map("source")
+pocSource <- "s3a://tthyer-mobilehealth-poc"
+if (!(pocSource %in% mountSources)) {
+  dbutils.fs.mount(pocSource, "/mnt/mhealth") 
+}
+```
+
+### Read tremor table parquet into Sparklyr table
+
+*Time: 2 seconds*
+
+```{r}
+metadataPath <- "/mnt/mhealth/parquet/tremor_table.parquet"
+metadataTbl <- sparklyr::spark_read_parquet(sc, name="metadataTbl", path=metadataPath)
+head(metadataTbl)
+```
+
+### Read left handInLap parquet data into Sparklyr table -- limit to single day
+Most of the time is spent "listing leaf files and directories". I think it's having to scan the contents of all the files even if it doesn't move all the data. Note that after the filter, the resulting table is only ~100K rows.
+
+*Time: 2 minutes 45 seconds*
+
+```{r}
+leftParquetPath <- "/mnt/mhealth/parquet/tremor_activity_2020_freeze/measure=deviceMotion_tremor_handInLap_left_json_items/"
+leftHandInLapTbl <- sparklyr::spark_read_parquet(
+  sc, 
+  name="leftHandInLapTbl",
+  path=leftParquetPath,
+  memory=FALSE) %>%
+  dplyr::filter(date == "2016-03-21")
+head(leftHandInLapTbl)
+```
+
+### Try using schema
+Specify a schema to see if that speeds up reading in this data.
+
+Result: it doesn't. In fact it takes longer. This is the opposite of how Spark usually works, where data reads take longer if you don't specify the schema. Why?
+
+*Time: 4 minutes*
+
+```{r}
+wType <- sparklyr.nested::struct_field(sc, name="w", data_type=double_type(sc), nullable=TRUE)
+xType <- sparklyr.nested::struct_field(sc, name="x", data_type=double_type(sc), nullable=TRUE)
+yType <- sparklyr.nested::struct_field(sc, name="y", data_type=double_type(sc), nullable=TRUE)
+zType <- sparklyr.nested::struct_field(sc, name="z", data_type=double_type(sc), nullable=TRUE)
+xyzType <- sparklyr.nested::struct_type(sc, struct_fields=c(xType, yType, zType))
+attitudeType <- sparklyr.nested::struct_type(sc, struct_fields=c(wType, xType, yType, zType))
+magneticFieldType <- sparklyr.nested::struct_type(sc, struct_fields=c(
+  sparklyr.nested::struct_field(sc, name="accuracy", data_type=long_type(sc), nullable=TRUE),
+  sparklyr.nested::struct_field(sc, name="x", data_type=long_type(sc), nullable=TRUE),
+  sparklyr.nested::struct_field(sc, name="y", data_type=long_type(sc), nullable=TRUE),
+  sparklyr.nested::struct_field(sc, name="z", data_type=long_type(sc), nullable=TRUE)
+))
+
+schema <- sparklyr.nested::struct_type(
+  sc,
+  c(
+    sparklyr.nested::struct_field(sc, name="attitude", data_type=attitudeType, nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="userAcceleration", data_type=xyzType, nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="rotationRate", data_type=xyzType, nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="gravity", data_type=xyzType, nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="magneticField", data_type=magneticFieldType, nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="timestamp", data_type=double_type(sc), nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="date", data_type=date_type(sc), nullable=TRUE),
+    sparklyr.nested::struct_field(sc, name="record", data_type=string_type(sc), nullable=TRUE)
+    
+  )
+)
+leftHandInLapTbl <- sparklyr::spark_read_parquet(
+  sc, 
+  name="leftHandInLapTbl",
+  path=leftParquetPath,
+  memory=FALSE,
+  schema=schema) %>%
+  dplyr::filter(date == "2016-03-21")
+```
+
+### Find the earliest timestamp for each record
+
+*Time: <2 seconds*
+
+```{r}
+timestampMinsByRecordTbl <- leftHandInLapTbl %>%
+  dplyr::select(record, timestamp) %>%
+  dplyr::group_by(record) %>%
+  dplyr::summarise(min_timestamp = min(timestamp))
+head(timestampMinsByRecordTbl)
+```
+
+### Select only the required metadata columns
+
+*Time: <1 second*
+
+```{r}
+truncmetadataTbl <- metadataTbl %>%
+  dplyr::select(healthCode, recordId, createdOn, uploadDate)
+head(truncmetadataTbl)
+```
+
+### Using the timestamp mins, create a new "t" column where the timestamp min is the baseline 
+*Time: ~7 seconds*
+
+```{r}
+# val leftWithTTbl = (timestampMinsByRecordTbl
+#                 .join(leftDf,"record")
+#                 .withColumn("t", $"timestamp" - $"min(timestamp)")
+#                 .drop("timestamp", "min(timestamp)"))
+leftWithTTbl <- timestampMinsByRecordTbl %>%
+  sparklyr::left_join(leftHandInLapTbl, by="record") %>%
+  dplyr::group_by(record) %>%
+  dplyr::mutate(t = timestamp - min_timestamp) %>%
+  dplyr::select(-c(timestamp, min_timestamp))
+head(leftWithTTbl)
+```
+
+### Create separate, flattened tables for acceleration, rotation, and gravity
+*Time: ~13 seconds for three tables*
+
+```{r}
+accelTbl <- leftWithTTbl %>%
+  sparklyr.nested::sdf_unnest(userAcceleration) %>%
+  dplyr::select(record, t, x, y, z)
+head(accelTbl)
+```
+
+
+```{r}
+gyroTbl <- leftWithTTbl %>%
+  sparklyr.nested::sdf_unnest(rotationRate) %>%
+  dplyr::select(record, t, x, y, z)
+head(gyroTbl)
+```
+
+
+```{r}
+gravTbl <- leftWithTTbl %>%
+  sparklyr.nested::sdf_unnest(gravity) %>%
+  dplyr::select(record, t, x, y, z)
+head(gravTbl)
+```
+
+### Save new intermediate tables
+*Time: 11 seconds to save*
+
+```{r}
+spark_write_parquet(accelTbl, path="s3a://tthyer-mobilehealth-poc/mhealth/tmp/accelTbl", mode="overwrite")
+spark_write_parquet(gyroTbl, path="s3a://tthyer-mobilehealth-poc/mhealth/tmp/gyroTbl", mode="overwrite")
+spark_write_parquet(gravTbl, path="s3a://tthyer-mobilehealth-poc/mhealth/tmp/gravTbl", mode="overwrite")
+```
+
+
+```{r}
+tmpSource <- "s3a://tthyer-mobilehealth-poc/mhealth/tmp"
+if (!(tmpSource %in% mountSources)) {
+  dbutils.fs.mount(tmpSource, "/mnt/mhealth/tmp") 
+}
+```
+
+
+```{r}
+accelPath <- "/mnt/mhealth/tmp/accelTbl"
+accelTbl <- sparklyr::spark_read_parquet(sc, name="accelTbl", path=accelPath)
+```
+
+### Apply the sampling rate function to the acceleration table
+1. This function is copied from mhealthtools -- in Databricks we cannot install R packages across cluster that are not on CRAN
+2. This is a test of using spark_apply from sparklyr to apply regular R functions
+
+*Time: 6 minutes! Why is sparklyr spark_apply so bad? Can it be tuned more?*
+
+```{r}
+# Copied from mhealthtools 
+# note that this assume the df is coming from a single sensor file
+
+#' Calculate the sampling rate.
+#'
+#' @param sensor_data A data frame with a time column \code{t}
+#' @return The sampling rate (number of samples taken per second on average).
+get_sampling_rate <- function(sensor_data) {
+  tryCatch({
+    t_length <- length(sensor_data$t)
+    sampling_rate <-  t_length / (sensor_data$t[t_length] - sensor_data$t[1])
+    return(sampling_rate)
+  }, error = function(e) { NA })
+}
+
+accelSamplingRateTbl <- accelTbl %>%
+  sparklyr::spark_apply(get_sampling_rate, group_by="record")
+
+head(accelSamplingRateTbl)
+```
+
+### Try same experiment but use SparkR gapply
+This requires rewriting so that the function signature takes two parameters, a "key" for the grouping variable(s) and "x" for the dataframe.
+
+*Time: 3 seconds! That's more like it.*
+
+```{r}
+# I have not yet found a way to convert from tbl_spark to a SparkR dataframe, so read in this data again
+accelSparkDf <- SparkR::read.df(accelPath, "parquet")
+display(accelSparkDf)
+```
+
+
+```{r}
+schema <- structType(structField("record", "string"), structField("sampling_rate", "double"))
+accelSamplingRateSparkDf <- SparkR::gapply(accelSparkDf, "record", function(key, x) {
+  t_length <- length(x$t)
+  sampling_rate <- data.frame(key, t_length / (x$t[t_length] - x$t[1]))
+  return(sampling_rate)
+}, schema)
+display(accelSamplingRateSparkDf)
+```
+
+### Try using SparkR gapply again but wrap the original R function
+This wraps the R function from mhealthools `get_sampling_rate`, but requires a specific function signature of R dataframe in, vector out
+
+*Time: ~3 seconds*
+
+```{r}
+dfFuncWrapper <- function(origFunc) {
+  return (function(key, x) data.frame(key, origFunc(x)))
+}
+accelSamplingRateSparkAltDf <- SparkR::gapply(accelSparkDf, "record", dfFuncWrapper(get_sampling_rate), schema)
+display(accelSamplingRateSparkAltDf)
+```
